@@ -6,6 +6,7 @@ import trimesh
 import torch
 import einops
 import argparse
+import csv
 from PIL import Image
 from tqdm import trange
 from torch.nn import functional as F
@@ -16,6 +17,70 @@ from dust3r.utils.device import to_numpy
 from dust3r.image_pairs import make_pairs
 from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
 from scene.colmap_loader import rotmat2qvec
+
+import open3d as o3d
+import numpy as np
+
+def create_camera_frustum(pose, focal, image_width, image_height, scale=0.1):
+    print("Pose:", pose)
+    print("Focal:", focal)
+    print("Image dimensions:", image_width, image_height)
+
+    half_width = image_width / (2 * focal)
+    half_height = image_height / (2 * focal)
+    
+    frustum_points = np.array([
+        [0, 0, 0],  # Camera center
+        [half_width, half_height, 1],   # Top right
+        [-half_width, half_height, 1],  # Top left
+        [-half_width, -half_height, 1], # Bottom left
+        [half_width, -half_height, 1]   # Bottom right
+    ]) * scale
+
+    print("Frustum points before transformation:", frustum_points)
+
+    try:
+        frustum_points_world = (pose @ np.hstack([frustum_points, np.ones((5, 1))]).T).T[:, :3]
+        print("Frustum points world after transformation:", frustum_points_world)
+    except Exception as e:
+        print(f"Error during transformation: {e}")
+
+    lines = np.array([
+        [0, 1], [0, 2], [0, 3], [0, 4], # Camera center to corners
+        [1, 2], [2, 3], [3, 4], [4, 1]  # Edges of the frustum
+    ], dtype=np.int32)
+
+    frustum_points_world = np.array(frustum_points_world, dtype=np.float64)
+    lines = np.array(lines, dtype=np.int32)
+
+    frustum = o3d.geometry.LineSet(
+        points=o3d.utility.Vector3dVector(frustum_points_world),
+        lines=o3d.utility.Vector2iVector(lines)
+    )
+
+    return frustum
+
+def visualize_camera_poses_and_directions(poses, focals, image_widths, image_heights, output_file="camera_poses.ply"):
+    """
+    Visualizes the camera poses and directions as frustums and saves the scene as a 3D point cloud.
+    Does not create a visualizer window for headless SSH execution.
+    """
+    frustums = []
+    for pose, focal, width, height in zip(poses, focals, image_widths, image_heights):
+        print(pose, focal, width, height)
+        frustum = create_camera_frustum(pose, focal, width, height)
+        frustums.append(frustum)
+        print(frustums)
+
+    print("********************* 2as ")
+    # Combine all frustums into one point cloud
+    combined_geometry = o3d.geometry.TriangleMesh()
+    for frustum in frustums:
+        combined_geometry += frustum
+
+    # Save the combined frustums as a PLY file
+    o3d.io.write_triangle_mesh(output_file, combined_geometry)
+    print(f"Camera poses saved to {output_file}")
 
 
 def qvec2rvec(q):
@@ -121,6 +186,25 @@ def get_visual_hull(N, scale, Ks, Ts, original_images, original_masks):
 
     return idx.cpu().numpy(), color.cpu().numpy() / 255
 
+def extract_camera_poses(poses, image_names, output_csv):
+    """
+    Extract and save camera poses to a CSV file.
+
+    Args:
+        poses (list of torch.Tensor): List of camera poses (4x4 transformation matrices).
+        image_names (list of str): List of image names corresponding to the poses.
+        output_csv (str): Path to save the extracted camera poses.
+    """
+    with open(output_csv, mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(['Image Name', 'Camera Pose'])
+
+        for image_name, pose in zip(image_names, poses):
+            pose_str = ' '.join(map(str, pose.flatten().tolist()))
+            writer.writerow([image_name, pose_str])
+
+    print(f'Camera poses saved to {output_csv}')
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('-s', '--source-path', type=str, default='data/realcap/rabbit')
@@ -146,7 +230,7 @@ if __name__ == "__main__":
     original_images = [Image.open(image) for image in images]
     masks = sorted(os.listdir(os.path.join(scene_path, 'masks')))
     masks = [os.path.join(scene_path, 'masks', masks[id]) for id in ids]
-    original_masks = [np.array(Image.open(mask).resize(image.size))[:, :, 0] / 255.0 for mask, image in zip(masks, original_images)]
+    original_masks = [np.array(Image.open(mask).resize(image.size).convert('RGB'))[:, :, 0] / 255.0 for mask, image in zip(masks, original_images)]
 
     loaded_images = load_images(images, size=512)
     pairs = make_pairs(loaded_images, scene_graph='complete', prefilter=None, symmetrize=True)
@@ -161,6 +245,20 @@ if __name__ == "__main__":
     depths = scene.get_depthmaps()
     confidence_masks = scene.get_masks()
     confidences = scene.get_conf()
+
+    image_widths = [img.size[0] for img in original_images]
+    image_heights = [img.size[1] for img in original_images]
+    
+    # Visualize and save the camera poses and frustums
+    # for e in poses:
+    #     print(e)
+    # visualize_camera_poses_and_directions(
+    #     poses=[pose.detach().cpu().numpy() for pose in poses], 
+    #     focals=[focal.item() for focal in focals], 
+    #     image_widths=image_widths, 
+    #     image_heights=image_heights,
+    #     output_file="camera_poses.ply"
+    # )
 
     mask_mesh = to_numpy(scene.get_masks())
     pts3d_mesh = to_numpy(scene.get_pts3d())
@@ -213,6 +311,7 @@ if __name__ == "__main__":
 
     depths = np.array([depth.detach().cpu().numpy() for depth in depths])
     depths = depths / max_bbox * rescale
+    print("guardando", os.path.join(scene_path, f'dust3r_depth_{sparse_num}.npy'))
     np.save(os.path.join(scene_path, f'dust3r_depth_{sparse_num}.npy'), depths)
     confidences = np.array([confidence.detach().cpu().numpy() for confidence in confidences])
     np.save(os.path.join(scene_path, f'dust3r_confidence_{sparse_num}.npy'), confidences)
@@ -233,5 +332,9 @@ if __name__ == "__main__":
         json.dump(cameras, f, indent=4)
 
     cloud = trimesh.PointCloud(vertices, colors)
+    print("Export", os.path.join(scene_path, f'dust3r_{sparse_num}.ply'))
     cloud.export(os.path.join(scene_path, f'dust3r_{sparse_num}.ply'))
+    # Extract and save camera poses to CSV
+    output_csv = os.path.join(scene_path, 'camera_poses.csv')
+    extract_camera_poses(poses, [os.path.basename(image) for image in images], output_csv)
 
